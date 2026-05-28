@@ -1030,7 +1030,7 @@ class reserve:
         """旋转滑块验证码求解。"""
         logging.info("Start to resolve rotate captcha token")
         captcha_token, captcha_iv, shade_url, cutout_url = self.get_rotate_captcha_data()
-        if not captcha_token or not captcha_iv or not shade_url or not cutout_url:
+        if not captcha_token or not shade_url or not cutout_url:
             logging.warning("Failed to get rotate captcha payload")
             return ""
 
@@ -1273,9 +1273,10 @@ class reserve:
             "runEnv": "10",
             "version": "1.1.20",
             "t": "a",
-            "iv": captcha_iv,
             "_": int(time.time() * 1000),
         }
+        if captcha_iv:
+            params["iv"] = captcha_iv
         try:
             response = self._get(
                 "https://captcha.chaoxing.com/captcha/check/verification/result",

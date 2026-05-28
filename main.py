@@ -824,6 +824,48 @@ def strategic_first_attempt(
             )
             return ""
 
+        def _resolve_single_captcha_until_success(
+            captcha_session,
+            captcha_type_name: str,
+            label: str,
+            *,
+            max_retries: int | None = 3,
+            deadline_func=None,
+        ) -> str:
+            attempt = 0
+            log_name = captcha_type_name.capitalize()
+            while max_retries is None or attempt < max_retries:
+                attempt += 1
+                if deadline_func is not None and deadline_func() <= 0:
+                    logging.warning(
+                        f"[strategic] {log_name} {label} stopped before success: preheat deadline reached"
+                    )
+                    return ""
+                try:
+                    captcha = captcha_session.resolve_captcha(captcha_type_name) or ""
+                except Exception as e:
+                    logging.debug(
+                        f"[strategic] {log_name} {label} attempt {attempt} raised: {e}"
+                    )
+                    captcha = ""
+                if captcha:
+                    logging.info(
+                        f"[strategic] {log_name} {label} resolved on attempt {attempt}"
+                    )
+                    return captcha
+                if max_retries is None or attempt < max_retries:
+                    if deadline_func is None:
+                        time.sleep(0.2)
+                    else:
+                        sleep_s = min(0.2, max(0.0, deadline_func()))
+                        if sleep_s > 0:
+                            time.sleep(sleep_s)
+
+            logging.warning(
+                f"[strategic] {log_name} {label} failed after {max_retries} attempts"
+            )
+            return ""
+
         is_primary_strategy_config = shared_strategy_session is None
         if is_primary_strategy_config:
             # 1. 只有首个配置执行登录和预热；后续配置直接复用这个登录态。
@@ -892,8 +934,55 @@ def strategic_first_attempt(
                 ten_before = target_dt - datetime.timedelta(seconds=STRATEGY_SLIDER_LEAD_SECONDS)
                 _wait_until(ten_before)
 
-            if ENABLE_ROTATE or ENABLE_SLIDER:
-                active_captcha_type = "rotate" if ENABLE_ROTATE else "slide"
+            if ENABLE_ROTATE:
+                captcha_results = {1: "", 2: "", 3: ""}
+                live_captcha_results = captcha_results
+                remaining = _remaining_captcha_seconds()
+                if remaining <= 0:
+                    logging.warning("[strategic] Captcha preheat budget exhausted before rotate starts, skip preheat")
+                else:
+                    def _make_rotate_worker():
+                        worker = reserve(
+                            sleep_time=SLEEPTIME,
+                            max_attempt=MAX_ATTEMPT,
+                            enable_slider=ENABLE_SLIDER,
+                            enable_textclick=ENABLE_TEXTCLICK,
+                            enable_rotate=ENABLE_ROTATE,
+                            reserve_next_day=RESERVE_NEXT_DAY,
+                            reserve_day_offset=RESERVE_DAY_OFFSET,
+                        )
+                        worker.requests.cookies.update(s.requests.cookies)
+                        worker.requests.headers.update(s.requests.headers)
+                        worker.set_captcha_context(
+                            roomid=roomid,
+                            seat_num=first_seat,
+                            day=submit_day,
+                            seat_page_id=seat_page_id,
+                            fid_enc=fid_enc,
+                        )
+                        return worker
+
+                    logging.info(
+                        "[strategic] Preheat one rotate captcha until it has validate "
+                        "or reaches the captcha deadline"
+                    )
+                    captcha_results[1] = _resolve_single_captcha_until_success(
+                        _make_rotate_worker(),
+                        "rotate",
+                        "preheat captcha1",
+                        max_retries=None,
+                        deadline_func=_remaining_captcha_seconds,
+                    ) or ""
+
+                captcha1 = captcha_results[1]
+                captcha2 = ""
+                captcha3 = ""
+                logging.info(
+                    "[strategic] Pre-resolved rotate captcha ready: %s",
+                    bool(captcha1),
+                )
+            elif ENABLE_SLIDER:
+                active_captcha_type = "slide"
 
                 def _resolve_image_captcha_parallel(slot_idx: int) -> str:
                     if _remaining_captcha_seconds() <= 0:
@@ -1077,8 +1166,20 @@ def strategic_first_attempt(
                 f"[strategic] Reuse preheated session from {shared_strategy_username} for {username}; "
                 "skip login and captcha preheat"
             )
-            if ENABLE_ROTATE or ENABLE_SLIDER:
-                active_captcha_type = "rotate" if ENABLE_ROTATE else "slide"
+            if ENABLE_ROTATE:
+                logging.info(
+                    "[strategic] Captcha preheat skipped for this config; resolve one rotate captcha first"
+                )
+                captcha1 = _resolve_single_captcha_until_success(
+                    s,
+                    "rotate",
+                    "reuse-session captcha1",
+                    max_retries=3,
+                ) or ""
+                captcha2 = ""
+                captcha3 = ""
+            elif ENABLE_SLIDER:
+                active_captcha_type = "slide"
                 logging.info(
                     f"[strategic] Captcha preheat skipped for this config; resolve {active_captcha_type} captchas on demand"
                 )
@@ -1100,29 +1201,29 @@ def strategic_first_attempt(
         captcha_required = bool(ENABLE_ROTATE or ENABLE_SLIDER or ENABLE_TEXTCLICK)
         captcha_type = "rotate" if ENABLE_ROTATE else ("slide" if ENABLE_SLIDER else "textclick")
         raw_captchas = [captcha1, captcha2, captcha3]
-        if ENABLE_TEXTCLICK and captcha1:
+        if (ENABLE_TEXTCLICK or ENABLE_ROTATE) and captcha1:
             captchas_for_submit = [captcha1, captcha1, captcha1]
             logging.info(
-                "[strategic] Reuse one preheated textclick captcha for the first three submits"
+                f"[strategic] Reuse one preheated {captcha_type} captcha for the first three submits"
             )
         else:
             captchas_for_submit = [captcha for captcha in raw_captchas if captcha]
-        expected_single_textclick = bool(
-            ENABLE_TEXTCLICK
+        expected_single_reused_captcha = bool(
+            (ENABLE_TEXTCLICK or ENABLE_ROTATE)
             and captchas_for_submit
             and raw_captchas[0]
             and not raw_captchas[1]
             and not raw_captchas[2]
         )
-        if captcha_required and captchas_for_submit != raw_captchas and not expected_single_textclick:
+        if captcha_required and captchas_for_submit != raw_captchas and not expected_single_reused_captcha:
             logging.warning(
                 "[strategic] Normalize captcha submit order to avoid empty captcha: "
                 f"raw={raw_captchas}, non_empty_count={len(captchas_for_submit)}"
             )
-        elif expected_single_textclick:
+        elif expected_single_reused_captcha:
             logging.info(
-                "[strategic] Textclick submit order uses one prepared captcha for "
-                "the first three submits"
+                f"[strategic] {captcha_type} submit order uses one prepared captcha "
+                "for the first three submits"
             )
         captchas_for_submit = (captchas_for_submit + ["", "", ""])[:3]
         captcha1, captcha2, captcha3 = captchas_for_submit
@@ -1136,12 +1237,12 @@ def strategic_first_attempt(
             if not captcha_required or not live_captcha_results:
                 return
 
-            if ENABLE_TEXTCLICK:
+            if ENABLE_TEXTCLICK or ENABLE_ROTATE:
                 live_first = live_captcha_results.get(1, "")
                 if live_first and not captchas_for_submit[0]:
                     captchas_for_submit[:] = [live_first, live_first, live_first]
                     logging.info(
-                        "[strategic] Refreshed reused textclick captcha from late preheat result"
+                        f"[strategic] Refreshed reused {captcha_type} captcha from late preheat result"
                     )
                 return
 
@@ -1196,6 +1297,37 @@ def strategic_first_attempt(
                     f"[strategic] Failed to prepare textclick captcha for submit shot {shot_idx}"
                 )
 
+        def _prepare_rotate_captcha_for_submit(
+            shot_idx: int,
+            reason: str,
+            *,
+            max_retries: int | None = 3,
+        ):
+            if not ENABLE_ROTATE:
+                return
+
+            _refresh_submit_captchas_from_live_results()
+            list_idx = shot_idx - 1
+            if not (0 <= list_idx < len(captchas_for_submit)):
+                return
+
+            logging.info(
+                f"[strategic] {reason}; immediately resolve a fresh rotate captcha "
+                f"for submit shot {shot_idx} and replace the reused preheated captcha"
+            )
+            captcha = _resolve_single_captcha_until_success(
+                s,
+                "rotate",
+                f"submit shot {shot_idx}",
+                max_retries=max_retries,
+            ) or ""
+            if captcha:
+                captchas_for_submit[list_idx] = captcha
+            else:
+                logging.warning(
+                    f"[strategic] Failed to prepare rotate captcha for submit shot {shot_idx}"
+                )
+
         def _last_submit_failure_msg() -> str:
             if not isinstance(s.last_submit_result, dict):
                 return ""
@@ -1219,9 +1351,9 @@ def strategic_first_attempt(
             if captcha:
                 return captcha
 
-            if ENABLE_TEXTCLICK and shot_idx == 1:
+            if (ENABLE_TEXTCLICK or ENABLE_ROTATE) and shot_idx == 1:
                 logging.error(
-                    "[strategic] Textclick captcha1 is still empty when submit shot 1 needs it; "
+                    f"[strategic] {captcha_type} captcha1 is still empty when submit shot 1 needs it; "
                     "skip this strategic submit instead of resolving after token fetch"
                 )
                 return None
@@ -1254,7 +1386,7 @@ def strategic_first_attempt(
             return None
 
         def _ensure_textclick_captcha1_before_strategic_token() -> bool:
-            if not ENABLE_TEXTCLICK:
+            if not (ENABLE_TEXTCLICK or ENABLE_ROTATE):
                 return True
 
             _refresh_submit_captchas_from_live_results()
@@ -1266,11 +1398,13 @@ def strategic_first_attempt(
 
             if _beijing_now() < hard_deadline:
                 logging.warning(
-                    "[strategic] Textclick captcha1 empty before token stage; "
+                    f"[strategic] {captcha_type} captcha1 empty before token stage; "
                     f"continue resolving until {hard_deadline} before fetching token"
                 )
 
                 if (
+                    ENABLE_TEXTCLICK
+                    and
                     textclick_preheat_thread is not None
                     and textclick_preheat_thread.is_alive()
                 ):
@@ -1283,7 +1417,7 @@ def strategic_first_attempt(
                     _refresh_submit_captchas_from_live_results()
                     if captchas_for_submit[0]:
                         logging.info(
-                            "[strategic] Textclick captcha1 received from existing "
+                            f"[strategic] {captcha_type} captcha1 received from existing "
                             "preheat thread before strategic token fetch"
                         )
                         return True
@@ -1291,24 +1425,33 @@ def strategic_first_attempt(
                 def _remaining_first_captcha_seconds() -> float:
                     return (hard_deadline - _beijing_now()).total_seconds()
 
-                captcha = _resolve_textclick_with_retries(
-                    s,
-                    "captcha1 pre-token guarantee",
-                    max_retries=None,
-                    deadline_func=_remaining_first_captcha_seconds,
-                ) or ""
+                if ENABLE_TEXTCLICK:
+                    captcha = _resolve_textclick_with_retries(
+                        s,
+                        "captcha1 pre-token guarantee",
+                        max_retries=None,
+                        deadline_func=_remaining_first_captcha_seconds,
+                    ) or ""
+                else:
+                    captcha = _resolve_single_captcha_until_success(
+                        s,
+                        "rotate",
+                        "captcha1 pre-token guarantee",
+                        max_retries=None,
+                        deadline_func=_remaining_first_captcha_seconds,
+                    ) or ""
                 if captcha:
                     captchas_for_submit[0] = captcha
 
             _refresh_submit_captchas_from_live_results()
             if captchas_for_submit[0]:
                 logging.info(
-                    "[strategic] Textclick captcha1 is ready before strategic token fetch"
+                    f"[strategic] {captcha_type} captcha1 is ready before strategic token fetch"
                 )
                 return True
 
             logging.error(
-                "[strategic] Textclick captcha1 is empty at the hard deadline; "
+                f"[strategic] {captcha_type} captcha1 is empty at the hard deadline; "
                 "skip strategic token fetch/submit to avoid post-token captcha resolving"
             )
             return False
@@ -1843,10 +1986,20 @@ def strategic_first_attempt(
                         "First submit failed because of captcha",
                         max_retries=None,
                     )
+                    _prepare_rotate_captcha_for_submit(
+                        2,
+                        "First submit failed because of captcha",
+                        max_retries=None,
+                    )
                 elif ENABLE_TEXTCLICK:
                     logging.info(
                         "[strategic] First submit did not fail because of captcha; "
                         "reuse the preheated textclick captcha for second submit"
+                    )
+                elif ENABLE_ROTATE:
+                    logging.info(
+                        "[strategic] First submit did not fail because of captcha; "
+                        "reuse the preheated rotate captcha for second submit"
                     )
 
                 if STRATEGIC_MODE == "A":
@@ -1922,10 +2075,20 @@ def strategic_first_attempt(
                         "Second submit failed because of captcha",
                         max_retries=None,
                     )
+                    _prepare_rotate_captcha_for_submit(
+                        3,
+                        "Second submit failed because of captcha",
+                        max_retries=None,
+                    )
                 elif ENABLE_TEXTCLICK:
                     logging.info(
                         "[strategic] Second submit did not fail because of captcha; "
                         "reuse the current textclick captcha for third submit"
+                    )
+                elif ENABLE_ROTATE:
+                    logging.info(
+                        "[strategic] Second submit did not fail because of captcha; "
+                        "reuse the current rotate captcha for third submit"
                     )
 
                 token3, value3 = s._get_page_token(
