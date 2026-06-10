@@ -217,7 +217,7 @@ def _getusedtimes_conflict_ready(handle) -> bool | None:
 
 ENDTIME = "23:22:40"  # 根据学校的预约座位时间+40ms即可
 WARM_CONNECTION_LEAD_MS = 2500  # 连接预热提前量（毫秒）
-TEXTCLICK_FIRST_CAPTCHA_GUARD_MS = 50  # 首枪选字验证码最晚补齐时间：target_dt 前多少毫秒
+TEXTCLICK_FIRST_CAPTCHA_GUARD_MS = -1000  # 正数表示 T 前截止，负数表示允许延迟到 T 后
 FIRST_TOKEN_DATE_MODE = "today"  # 首次取 token 的日期：today 或 submit_date
 RESERVE_NEXT_DAY = True  # 预约明天而不是今天的
 RESERVE_DAY_OFFSET = None  # 可选：覆盖提交参数 day 的北京时间日期偏移，2 表示后天
@@ -336,6 +336,13 @@ def _parse_int_range(value, fallback):
     return fallback, fallback
 
 
+def _normalize_slider_lead_range_value_ms(value: int) -> int:
+    """只规范 slider_lead_seconds_range：兼容旧秒值，且至少提前 5000ms。"""
+    value = int(value)
+    value = value * 1000 if 0 <= value < 30 else value
+    return max(5000, value)
+
+
 def _apply_strategy_config(config):
     global ENDTIME
     global RELOGIN_EVERY_LOOP
@@ -344,7 +351,7 @@ def _apply_strategy_config(config):
     global ENABLE_TEXTCLICK
     global ENABLE_ROTATE
     global STRATEGY_LOGIN_LEAD_SECONDS
-    global STRATEGY_SLIDER_LEAD_SECONDS
+    global STRATEGY_SLIDER_LEAD_MS
     global STRATEGIC_MODE
     global PRE_FETCH_TOKEN_MS
     global FIRST_SUBMIT_OFFSET_MS
@@ -381,16 +388,28 @@ def _apply_strategy_config(config):
             min(login_lead_min, login_lead_max),
             max(login_lead_min, login_lead_max),
         )
-    if "slider_lead_seconds" in strategy_cfg:
-        STRATEGY_SLIDER_LEAD_SECONDS = int(strategy_cfg.get("slider_lead_seconds", 14))
-    else:
+    if "slider_lead_seconds_range" in strategy_cfg:
         slider_lead_min, slider_lead_max = _parse_int_range(
             strategy_cfg.get("slider_lead_seconds_range"),
-            14,
+            14000,
         )
-        STRATEGY_SLIDER_LEAD_SECONDS = random.randint(
-            min(slider_lead_min, slider_lead_max),
-            max(slider_lead_min, slider_lead_max),
+        normalized_slider_min = _normalize_slider_lead_range_value_ms(slider_lead_min)
+        normalized_slider_max = _normalize_slider_lead_range_value_ms(slider_lead_max)
+        STRATEGY_SLIDER_LEAD_MS = random.randint(
+            min(normalized_slider_min, normalized_slider_max),
+            max(normalized_slider_min, normalized_slider_max),
+        )
+    else:
+        STRATEGY_SLIDER_LEAD_MS = int(strategy_cfg.get("slider_lead_seconds", 14)) * 1000
+    if (
+        (ENABLE_ROTATE or ENABLE_SLIDER or ENABLE_TEXTCLICK)
+        and STRATEGY_SLIDER_LEAD_MS > STRATEGY_LOGIN_LEAD_SECONDS * 1000
+    ):
+        logging.warning(
+            "[strategic] Captcha preheat lead %dms exceeds login lead %ds; "
+            "actual captcha preheat cannot start before login completes",
+            STRATEGY_SLIDER_LEAD_MS,
+            STRATEGY_LOGIN_LEAD_SECONDS,
         )
     STRATEGIC_MODE = strategy_cfg.get("mode", "B")
     PRE_FETCH_TOKEN_MS = int(strategy_cfg.get("pre_fetch_token_ms", 3000))
@@ -918,7 +937,7 @@ def strategic_first_attempt(
             shared_strategy_session = s
             shared_strategy_username = username
 
-            # 验证码预热整体预算：最多占用 [T-slider_lead_seconds, T] 这段时间。
+            # 验证码预热整体预算：最多占用 [T-slider_lead_seconds_range(ms), T] 这段时间。
             # 选字验证码需要先为连接预热让出时间，后面会在首枪取 token 前再做一次硬保证。
             captcha_deadline = target_dt
             if ENABLE_TEXTCLICK and WARM_CONNECTION_LEAD_MS > 0:
@@ -929,9 +948,9 @@ def strategic_first_attempt(
             def _remaining_captcha_seconds() -> float:
                 return (captcha_deadline - _beijing_now()).total_seconds()
 
-            # 2. 等到“目标时间前若干秒”，预热滑块验证码，提前拿到多份 validate（如果启用了滑块）
+            # 2. 按毫秒提前量等待，统一预热滑块、选字或旋转滑块验证码。
             if ENABLE_ROTATE or ENABLE_SLIDER or ENABLE_TEXTCLICK:
-                ten_before = target_dt - datetime.timedelta(seconds=STRATEGY_SLIDER_LEAD_SECONDS)
+                ten_before = target_dt - datetime.timedelta(milliseconds=STRATEGY_SLIDER_LEAD_MS)
                 _wait_until(ten_before)
 
             if ENABLE_ROTATE:
@@ -1397,7 +1416,7 @@ def strategic_first_attempt(
             if captchas_for_submit[0]:
                 return True
 
-            guard_ms = max(0, TEXTCLICK_FIRST_CAPTCHA_GUARD_MS)
+            guard_ms = TEXTCLICK_FIRST_CAPTCHA_GUARD_MS
             hard_deadline = target_dt - datetime.timedelta(milliseconds=guard_ms)
 
             if _beijing_now() < hard_deadline:
@@ -1456,7 +1475,7 @@ def strategic_first_attempt(
 
             logging.error(
                 f"[strategic] {captcha_type} captcha1 is empty at the hard deadline; "
-                "skip strategic token fetch/submit to avoid post-token captcha resolving"
+                "skip first strategic submit and continue follow-up shots"
             )
             return False
 
@@ -1697,10 +1716,15 @@ def strategic_first_attempt(
                         _fire_and_forget_warm_connection(s, _warm_url, timeout_s=warm_timeout_s)
                         warm_done = True
 
-        if not _ensure_textclick_captcha1_before_strategic_token():
-            continue
+        skip_first_strategic_submit = not _ensure_textclick_captcha1_before_strategic_token()
+        use_serial_followups = skip_first_strategic_submit and SUBMIT_MODE == "burst"
+        if use_serial_followups:
+            logging.warning(
+                "[strategic] Captcha1 missed hard deadline in burst mode; "
+                "skip the expired burst schedule and continue with serial second/third shots"
+            )
 
-        if SUBMIT_MODE == "burst":
+        if SUBMIT_MODE == "burst" and not use_serial_followups:
             # ── 定时连发（极限型）──
             n_shots = len(BURST_OFFSETS_MS)
             captchas_list = (
@@ -1801,7 +1825,14 @@ def strategic_first_attempt(
         else:
             # ── 串行重试（稳健型）──
             # 每枪等到 HTTP 响应后，失败才发下一枪
-            if STRATEGIC_MODE == "C":
+            if skip_first_strategic_submit:
+                logging.warning(
+                    "[strategic] First submit skipped because captcha1 missed hard deadline; "
+                    "continue directly with second strategic shot"
+                )
+                s.last_submit_result = None
+                suc = False
+            elif STRATEGIC_MODE == "C":
                 # 策略 C：先从 T + FAST_PROBE_START_OFFSET_MS 开始轻探测，
                 # 到 T + TOKEN_FETCH_DELAY_MS 后再正式取一次 token 并立即提交
                 fetch_dt = target_dt + datetime.timedelta(milliseconds=TOKEN_FETCH_DELAY_MS)
@@ -1970,7 +2001,7 @@ def strategic_first_attempt(
 
             # 如果第一次没有成功：重新获取页面 token，获取后立即提交第二枪
             if not suc:
-                if s.should_skip_followup_submit():
+                if not skip_first_strategic_submit and s.should_skip_followup_submit():
                     logging.info(
                         "[strategic] First submit hit terminal failure msg, skip second/third submit"
                     )
@@ -1978,22 +2009,29 @@ def strategic_first_attempt(
                     continue
                 logging.info("[strategic] First submit failed, prepare second submit with NEW page token")
                 first_failure_msg = _last_submit_failure_msg()
-                first_failed_by_captcha = _last_submit_failed_by_captcha()
+                first_failed_by_captcha = (
+                    skip_first_strategic_submit or _last_submit_failed_by_captcha()
+                )
                 logging.info(
                     "[strategic] First submit failure reason: %s; captcha_related=%s",
-                    first_failure_msg or "<empty>",
+                    (
+                        "captcha1 missed hard deadline"
+                        if skip_first_strategic_submit
+                        else (first_failure_msg or "<empty>")
+                    ),
                     first_failed_by_captcha,
                 )
                 if first_failed_by_captcha:
+                    captcha_retry_limit = 3 if skip_first_strategic_submit else None
                     _prepare_textclick_captcha_for_submit(
                         2,
                         "First submit failed because of captcha",
-                        max_retries=None,
+                        max_retries=captcha_retry_limit,
                     )
                     _prepare_rotate_captcha_for_submit(
                         2,
                         "First submit failed because of captcha",
-                        max_retries=None,
+                        max_retries=captcha_retry_limit,
                     )
                 elif ENABLE_TEXTCLICK:
                     logging.info(

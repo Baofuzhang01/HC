@@ -1554,6 +1554,7 @@ class reserve:
             return None
         
         # 下载验证码图片
+        download_started = _time.monotonic()
         try:
             headers = {
                 "Referer": "https://office.chaoxing.com/",
@@ -1563,8 +1564,17 @@ class reserve:
             with urllib.request.urlopen(req, timeout=10) as response:
                 img_bytes = response.read()
         except Exception as e:
-            logging.error(f"Failed to download captcha image: {e}")
+            logging.error(
+                "Failed to download textclick captcha image after %.3fs: %s",
+                _time.monotonic() - download_started,
+                e,
+            )
             return None
+        logging.info(
+            "Textclick captcha image download took %.3fs (%d bytes)",
+            _time.monotonic() - download_started,
+            len(img_bytes),
+        )
         
         # 可选调试：默认不落盘，避免影响关键路径时延
         if _should_save_captcha_debug_images():
@@ -1597,17 +1607,34 @@ class reserve:
                     codetype=chaojiying_codetype,
                 )
                 for attempt in range(1, 4):
+                    ocr_started = _time.monotonic()
                     try:
-                        positions = self._match_textclick_ocr_positions(
-                            ocr.recognize_textclick(img_bytes),
-                            target_text,
-                            "Chaojiying",
-                        )
+                        ocr_result = ocr.recognize_textclick(img_bytes)
                     except Exception as e:
-                        positions = None
                         logging.warning(
-                            f"Chaojiying textclick OCR raised on attempt {attempt}/3: {e}"
+                            "Chaojiying textclick OCR request attempt %d/3 failed after %.3fs: %s",
+                            attempt,
+                            _time.monotonic() - ocr_started,
+                            e,
                         )
+                        positions = None
+                    else:
+                        logging.info(
+                            "Chaojiying textclick OCR request attempt %d/3 took %.3fs",
+                            attempt,
+                            _time.monotonic() - ocr_started,
+                        )
+                        try:
+                            positions = self._match_textclick_ocr_positions(
+                                ocr_result,
+                                target_text,
+                                "Chaojiying",
+                            )
+                        except Exception as e:
+                            positions = None
+                            logging.warning(
+                                f"Chaojiying textclick OCR matching raised on attempt {attempt}/3: {e}"
+                            )
                     if positions:
                         if attempt > 1:
                             logging.info(
@@ -1650,10 +1677,21 @@ class reserve:
                 password=tuling_password,
                 model_id=tuling_model_id,
             )
+            ocr_started = _time.monotonic()
+            try:
+                ocr_result = ocr.recognize_textclick(img_bytes)
+            except Exception:
+                logging.warning(
+                    "TulingCloud textclick OCR request failed after %.3fs",
+                    _time.monotonic() - ocr_started,
+                )
+                raise
+            logging.info(
+                "TulingCloud textclick OCR request took %.3fs",
+                _time.monotonic() - ocr_started,
+            )
             return self._match_textclick_ocr_positions(
-                ocr.recognize_textclick(img_bytes),
-                target_text,
-                "TulingCloud",
+                ocr_result, target_text, "TulingCloud"
             )
         except Exception as e:
             logging.debug(f"Textclick OCR fallback failed: {e}")
