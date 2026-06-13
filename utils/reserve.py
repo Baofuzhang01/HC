@@ -7,7 +7,7 @@ import logging
 import datetime
 import os
 import threading
-from urllib.parse import urlparse, parse_qs, unquote, urlencode
+from urllib.parse import urlparse, parse_qs, unquote
 from urllib3.exceptions import InsecureRequestWarning
 from urllib3.util import Timeout as Urllib3Timeout
 from requests.adapters import HTTPAdapter
@@ -209,6 +209,24 @@ class reserve:
                 "seat": "https://office.chaoxing.com/data/apps/seat/getusedtimes",
                 "code": "https://office.chaoxing.com/front/third/apps/seat/code",
             },
+            "seatengine_code": {
+                "select": (
+                    "https://office.chaoxing.com/front/third/apps/seatengine/code?"
+                    "id={roomId}&seatNum={seatNum}&fidEnc={fidEnc}&seatId={seatPageId}"
+                ),
+                "submit": "https://office.chaoxing.com/data/apps/seatengine/submit",
+                "seat": "https://office.chaoxing.com/data/apps/seatengine/getusedtimes",
+                "code": "https://office.chaoxing.com/front/third/apps/seatengine/code",
+            },
+            "seat_code": {
+                "select": (
+                    "https://office.chaoxing.com/front/third/apps/seat/code?"
+                    "id={roomId}&seatNum={seatNum}&fidEnc={fidEnc}&seatId={seatPageId}"
+                ),
+                "submit": "https://office.chaoxing.com/data/apps/seat/submit",
+                "seat": "https://office.chaoxing.com/data/apps/seat/getusedtimes",
+                "code": "https://office.chaoxing.com/front/third/apps/seat/code",
+            },
         }
         self.api_family = "seatengine"
         self.url = ""
@@ -306,21 +324,29 @@ class reserve:
 
     def _alternate_api_family(self, family: str | None = None) -> str:
         current = str(family or self.api_family or "seatengine").strip().lower()
-        return "seat" if current == "seatengine" else "seatengine"
+        alternates = {
+            "seatengine": "seat",
+            "seat": "seatengine",
+            "seatengine_code": "seat_code",
+            "seat_code": "seatengine_code",
+        }
+        return alternates.get(current, "seatengine")
 
-    def _build_select_url_for_family(
+    def _build_token_url_for_family(
         self,
         family: str,
         roomid: str,
         day: str,
         seat_page_id: str | None,
         fid_enc: str | None,
+        seat_num: str | None = None,
     ) -> str:
         return self.api_urls[family]["select"].format(
             roomId=roomid,
             day=str(day),
             seatPageId=seat_page_id or "",
             fidEnc=fid_enc or "",
+            seatNum=seat_num or "",
         )
 
     def build_token_url(
@@ -331,12 +357,14 @@ class reserve:
         fid_enc: str | None,
         seat_num: str | None = None,
     ) -> str:
-        params = {
-            "id": str(roomid),
-            "seatNum": str(seat_num or ""),
-            "fidEnc": str(fid_enc or ""),
-        }
-        return f"{self.api_urls['seat']['code']}?{urlencode(params)}"
+        return self._build_token_url_for_family(
+            self.api_family,
+            roomid,
+            day,
+            seat_page_id,
+            fid_enc,
+            seat_num,
+        )
 
     def _get_select_url_candidates(self, url: str) -> list[tuple[str, str]]:
         urls = []
@@ -344,16 +372,25 @@ class reserve:
         raw = str(url or "")
         if raw:
             detected = current_family
+            is_code = "/code?" in raw
             if "/seatengine/" in raw:
-                detected = "seatengine"
+                detected = "seatengine_code" if is_code else "seatengine"
             elif "/apps/seat/" in raw or "/data/apps/seat/" in raw:
-                detected = "seat"
+                detected = "seat_code" if is_code else "seat"
             urls.append((detected, raw))
-            if "/code?" in raw:
-                return urls
 
-        for family in [self.api_family, self._alternate_api_family(self.api_family)]:
-            candidate = self.api_urls[family]["select"]
+        if raw:
+            parsed = urlparse(raw)
+            params = parse_qs(parsed.query, keep_blank_values=True)
+            family = self._alternate_api_family(detected)
+            candidate = self._build_token_url_for_family(
+                family,
+                (params.get("id") or [""])[0],
+                (params.get("day") or [""])[0],
+                (params.get("seatId") or [""])[0],
+                (params.get("fidEnc") or [""])[0],
+                (params.get("seatNum") or [""])[0],
+            )
             if not any(existing_url == candidate for _, existing_url in urls):
                 urls.append((family, candidate))
         return urls
@@ -774,7 +811,7 @@ class reserve:
         因此这里直接用 submit_enc 作为两者。
 
         参数:
-            url: seatengine/select 页面地址
+            url: 用于获取 submit_enc 的页面地址
             require_value: 是否返回算法值（即 submit_enc 本身）
             method: "GET" 或 "POST"，允许按前端实现切换请求方式
             data: 当使用 POST 时提交的表单数据
@@ -2195,7 +2232,6 @@ class reserve:
                         )
                         return suc
 
-                # 构造当前座位对应的页面 URL，并从页面获取 submit_enc。
                 page_url = self.build_token_url(
                     slot_roomid,
                     request_day,
